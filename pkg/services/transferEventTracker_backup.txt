@@ -1,0 +1,799 @@
+package trackingService
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"log"
+	"math/big"
+	"os"
+	"strings"
+	"time"
+
+	nftModel "github.com/aman/nft-tracker/pkg/models"
+	"github.com/ethereum/go-ethereum"
+	"github.com/ethereum/go-ethereum/accounts/abi"
+	"github.com/ethereum/go-ethereum/common"
+	"github.com/ethereum/go-ethereum/core/types"
+	"github.com/ethereum/go-ethereum/crypto"
+	"github.com/ethereum/go-ethereum/ethclient"
+	"go.mongodb.org/mongo-driver/mongo"
+)
+
+type TransferEventTracker struct {
+	client        *ethclient.Client
+	collection    *mongo.Collection
+	contractAddrs []common.Address
+}
+
+func NewTransferEventTracker(collection *mongo.Collection) (*TransferEventTracker, error) {
+	rpcEndpoint := os.Getenv("ETH_RPC_ENDPOINT")
+	if rpcEndpoint == "" {
+		return nil, errors.New("ETH_RPC_ENDPOINT environment variable is not set")
+	}
+	client, err := ethclient.Dial(rpcEndpoint)
+	if err != nil {
+		return nil, fmt.Errorf("error connecting to Ethereum client: %v", err)
+	}
+
+	contractAddrsEnv := os.Getenv("CONTRACT_ADDRESSES")
+	if contractAddrsEnv == "" {
+		return nil, errors.New("CONTRACT_ADDRESSES environment variable is not set")
+	}
+
+	var addrStrings []string
+	err = json.Unmarshal([]byte(contractAddrsEnv), &addrStrings)
+	if err != nil {
+		return nil, fmt.Errorf("failed to parse CONTRACT_ADDRESSES environment variable: %v", err)
+	}
+
+	contractAddrs := make([]common.Address, 0, len(addrStrings))
+	for _, addr := range addrStrings {
+		parsedAddr := common.HexToAddress(addr)
+		if parsedAddr == (common.Address{}) {
+			log.Printf("Invalid contract address: %s", addr)
+			continue
+		}
+		contractAddrs = append(contractAddrs, parsedAddr)
+	}
+
+	if len(contractAddrs) == 0 {
+		return nil, errors.New("no valid contract addresses found in CONTRACT_ADDRESSES environment variable")
+	}
+
+	return &TransferEventTracker{
+		client:        client,
+		collection:    collection,
+		contractAddrs: contractAddrs,
+	}, nil
+}
+
+func (t *TransferEventTracker) TrackTransferEvents(ctx context.Context) error {
+	transferEventSignature := []byte("Transfer(address,address,uint256)")
+	transferEventHash := crypto.Keccak256Hash(transferEventSignature)
+
+	// Step 1: Fetch historical events
+	startBlock := big.NewInt(14352320)
+	header, err := t.client.HeaderByNumber(ctx, nil)
+	if err != nil {
+		log.Printf("Failed to get latest block header: %v\n", err)
+		return err
+	}
+	latestBlock := header.Number
+
+	query := ethereum.FilterQuery{
+		FromBlock: startBlock,
+		ToBlock:   latestBlock,
+		Addresses: t.contractAddrs,
+		Topics:    [][]common.Hash{{transferEventHash}},
+	}
+
+	historicalLogs, err := t.client.FilterLogs(ctx, query)
+	if err != nil {
+		log.Printf("Failed to fetch historical Transfer events: %v\n", err)
+		return err
+	}
+
+	for _, delog := range historicalLogs {
+		err = t.processTransferLog(ctx, delog)
+		if err != nil {
+			log.Printf("Failed to process historical Transfer event log: %v\n", err)
+		}
+	}
+
+	// Step 2: Subscribe to new events
+	logs := make(chan types.Log)
+	subQuery := ethereum.FilterQuery{
+		FromBlock: latestBlock,
+		Addresses: t.contractAddrs,
+		Topics:    [][]common.Hash{{transferEventHash}},
+	}
+
+	sub, err := t.client.SubscribeFilterLogs(ctx, subQuery, logs)
+	if err != nil {
+		log.Printf("Failed to subscribe to Transfer events: %v\n", err)
+		return err
+	}
+	defer sub.Unsubscribe()
+
+	for {
+		select {
+		case err := <-sub.Err():
+			log.Printf("Subscription error: %v\n", err)
+			return err
+
+		case delog := <-logs:
+			log.Printf("delog...................", delog)
+			err = t.processTransferLog(ctx, delog)
+			if err != nil {
+				log.Printf("Failed to process new Transfer event log: %v\n", err)
+			}
+
+		case <-ctx.Done():
+			log.Printf("Context done, stopping event tracking")
+			return ctx.Err()
+		}
+	}
+	return nil
+}
+
+func (t *TransferEventTracker) processTransferLog(ctx context.Context, delog types.Log) error {
+	to, tokenId, err := decodeTransferLog(delog)
+	if err != nil {
+		return fmt.Errorf("failed to decode Transfer event log: %v", err)
+	}
+
+	log.Printf("delog.Data", delog.Data[0:])
+
+	nft := nftModel.NFT{
+		NftID:           tokenId.String(),
+		OwnerAddress:    to.Hex(),
+		ContractAddress: delog.Address.Hex(),
+		TxHash:          delog.TxHash.Hex(),
+		TimeStamp:       time.Now(),
+	}
+
+	// log.Printf("NFT: %+v\n", nft) // Print NFT details
+
+	_, err = t.collection.InsertOne(ctx, nft)
+	if err != nil {
+		return fmt.Errorf("failed to insert NFT data into MongoDB: %v", err)
+	}
+
+	return nil
+}
+
+func decodeTransferLog(delog types.Log) (common.Address, *big.Int, error) {
+	transferEventABI := `[
+		{
+			"inputs": [],
+			"stateMutability": "nonpayable",
+			"type": "constructor"
+		},
+		{
+			"anonymous": false,
+			"inputs": [
+				{
+					"indexed": true,
+					"internalType": "address",
+					"name": "owner",
+					"type": "address"
+				},
+				{
+					"indexed": true,
+					"internalType": "address",
+					"name": "approved",
+					"type": "address"
+				},
+				{
+					"indexed": true,
+					"internalType": "uint256",
+					"name": "tokenId",
+					"type": "uint256"
+				}
+			],
+			"name": "Approval",
+			"type": "event"
+		},
+		{
+			"anonymous": false,
+			"inputs": [
+				{
+					"indexed": true,
+					"internalType": "address",
+					"name": "owner",
+					"type": "address"
+				},
+				{
+					"indexed": true,
+					"internalType": "address",
+					"name": "operator",
+					"type": "address"
+				},
+				{
+					"indexed": false,
+					"internalType": "bool",
+					"name": "approved",
+					"type": "bool"
+				}
+			],
+			"name": "ApprovalForAll",
+			"type": "event"
+		},
+		{
+			"inputs": [
+				{
+					"internalType": "address",
+					"name": "to",
+					"type": "address"
+				},
+				{
+					"internalType": "uint256",
+					"name": "tokenId",
+					"type": "uint256"
+				}
+			],
+			"name": "approve",
+			"outputs": [],
+			"stateMutability": "nonpayable",
+			"type": "function"
+		},
+		{
+			"inputs": [
+				{
+					"internalType": "bytes32",
+					"name": "role",
+					"type": "bytes32"
+				},
+				{
+					"internalType": "address",
+					"name": "account",
+					"type": "address"
+				}
+			],
+			"name": "grantRole",
+			"outputs": [],
+			"stateMutability": "nonpayable",
+			"type": "function"
+		},
+		{
+			"inputs": [
+				{
+					"internalType": "address",
+					"name": "to",
+					"type": "address"
+				},
+				{
+					"internalType": "string",
+					"name": "hash",
+					"type": "string"
+				}
+			],
+			"name": "mint",
+			"outputs": [],
+			"stateMutability": "nonpayable",
+			"type": "function"
+		},
+		{
+			"inputs": [
+				{
+					"internalType": "bytes32",
+					"name": "role",
+					"type": "bytes32"
+				},
+				{
+					"internalType": "address",
+					"name": "account",
+					"type": "address"
+				}
+			],
+			"name": "renounceRole",
+			"outputs": [],
+			"stateMutability": "nonpayable",
+			"type": "function"
+		},
+		{
+			"inputs": [
+				{
+					"internalType": "bytes32",
+					"name": "role",
+					"type": "bytes32"
+				},
+				{
+					"internalType": "address",
+					"name": "account",
+					"type": "address"
+				}
+			],
+			"name": "revokeRole",
+			"outputs": [],
+			"stateMutability": "nonpayable",
+			"type": "function"
+		},
+		{
+			"anonymous": false,
+			"inputs": [
+				{
+					"indexed": true,
+					"internalType": "bytes32",
+					"name": "role",
+					"type": "bytes32"
+				},
+				{
+					"indexed": true,
+					"internalType": "bytes32",
+					"name": "previousAdminRole",
+					"type": "bytes32"
+				},
+				{
+					"indexed": true,
+					"internalType": "bytes32",
+					"name": "newAdminRole",
+					"type": "bytes32"
+				}
+			],
+			"name": "RoleAdminChanged",
+			"type": "event"
+		},
+		{
+			"anonymous": false,
+			"inputs": [
+				{
+					"indexed": true,
+					"internalType": "bytes32",
+					"name": "role",
+					"type": "bytes32"
+				},
+				{
+					"indexed": true,
+					"internalType": "address",
+					"name": "account",
+					"type": "address"
+				},
+				{
+					"indexed": true,
+					"internalType": "address",
+					"name": "sender",
+					"type": "address"
+				}
+			],
+			"name": "RoleGranted",
+			"type": "event"
+		},
+		{
+			"anonymous": false,
+			"inputs": [
+				{
+					"indexed": true,
+					"internalType": "bytes32",
+					"name": "role",
+					"type": "bytes32"
+				},
+				{
+					"indexed": true,
+					"internalType": "address",
+					"name": "account",
+					"type": "address"
+				},
+				{
+					"indexed": true,
+					"internalType": "address",
+					"name": "sender",
+					"type": "address"
+				}
+			],
+			"name": "RoleRevoked",
+			"type": "event"
+		},
+		{
+			"inputs": [
+				{
+					"internalType": "address",
+					"name": "from",
+					"type": "address"
+				},
+				{
+					"internalType": "address",
+					"name": "to",
+					"type": "address"
+				},
+				{
+					"internalType": "uint256",
+					"name": "tokenId",
+					"type": "uint256"
+				}
+			],
+			"name": "safeTransferFrom",
+			"outputs": [],
+			"stateMutability": "nonpayable",
+			"type": "function"
+		},
+		{
+			"inputs": [
+				{
+					"internalType": "address",
+					"name": "from",
+					"type": "address"
+				},
+				{
+					"internalType": "address",
+					"name": "to",
+					"type": "address"
+				},
+				{
+					"internalType": "uint256",
+					"name": "tokenId",
+					"type": "uint256"
+				},
+				{
+					"internalType": "bytes",
+					"name": "_data",
+					"type": "bytes"
+				}
+			],
+			"name": "safeTransferFrom",
+			"outputs": [],
+			"stateMutability": "nonpayable",
+			"type": "function"
+		},
+		{
+			"inputs": [
+				{
+					"internalType": "address",
+					"name": "operator",
+					"type": "address"
+				},
+				{
+					"internalType": "bool",
+					"name": "approved",
+					"type": "bool"
+				}
+			],
+			"name": "setApprovalForAll",
+			"outputs": [],
+			"stateMutability": "nonpayable",
+			"type": "function"
+		},
+		{
+			"inputs": [
+				{
+					"internalType": "string",
+					"name": "newUri",
+					"type": "string"
+				}
+			],
+			"name": "setBaseURI",
+			"outputs": [],
+			"stateMutability": "nonpayable",
+			"type": "function"
+		},
+		{
+			"anonymous": false,
+			"inputs": [
+				{
+					"indexed": true,
+					"internalType": "address",
+					"name": "from",
+					"type": "address"
+				},
+				{
+					"indexed": true,
+					"internalType": "address",
+					"name": "to",
+					"type": "address"
+				},
+				{
+					"indexed": true,
+					"internalType": "uint256",
+					"name": "tokenId",
+					"type": "uint256"
+				}
+			],
+			"name": "Transfer",
+			"type": "event"
+		},
+		{
+			"inputs": [
+				{
+					"internalType": "address",
+					"name": "from",
+					"type": "address"
+				},
+				{
+					"internalType": "address",
+					"name": "to",
+					"type": "address"
+				},
+				{
+					"internalType": "uint256",
+					"name": "tokenId",
+					"type": "uint256"
+				}
+			],
+			"name": "transferFrom",
+			"outputs": [],
+			"stateMutability": "nonpayable",
+			"type": "function"
+		},
+		{
+			"inputs": [
+				{
+					"internalType": "address",
+					"name": "owner",
+					"type": "address"
+				}
+			],
+			"name": "balanceOf",
+			"outputs": [
+				{
+					"internalType": "uint256",
+					"name": "",
+					"type": "uint256"
+				}
+			],
+			"stateMutability": "view",
+			"type": "function"
+		},
+		{
+			"inputs": [
+				{
+					"internalType": "string",
+					"name": "hash",
+					"type": "string"
+				}
+			],
+			"name": "checkNftHashExist",
+			"outputs": [
+				{
+					"internalType": "bool",
+					"name": "",
+					"type": "bool"
+				}
+			],
+			"stateMutability": "view",
+			"type": "function"
+		},
+		{
+			"inputs": [],
+			"name": "DEFAULT_ADMIN_ROLE",
+			"outputs": [
+				{
+					"internalType": "bytes32",
+					"name": "",
+					"type": "bytes32"
+				}
+			],
+			"stateMutability": "view",
+			"type": "function"
+		},
+		{
+			"inputs": [
+				{
+					"internalType": "uint256",
+					"name": "tokenId",
+					"type": "uint256"
+				}
+			],
+			"name": "getApproved",
+			"outputs": [
+				{
+					"internalType": "address",
+					"name": "",
+					"type": "address"
+				}
+			],
+			"stateMutability": "view",
+			"type": "function"
+		},
+		{
+			"inputs": [
+				{
+					"internalType": "bytes32",
+					"name": "role",
+					"type": "bytes32"
+				}
+			],
+			"name": "getRoleAdmin",
+			"outputs": [
+				{
+					"internalType": "bytes32",
+					"name": "",
+					"type": "bytes32"
+				}
+			],
+			"stateMutability": "view",
+			"type": "function"
+		},
+		{
+			"inputs": [
+				{
+					"internalType": "bytes32",
+					"name": "role",
+					"type": "bytes32"
+				},
+				{
+					"internalType": "address",
+					"name": "account",
+					"type": "address"
+				}
+			],
+			"name": "hasRole",
+			"outputs": [
+				{
+					"internalType": "bool",
+					"name": "",
+					"type": "bool"
+				}
+			],
+			"stateMutability": "view",
+			"type": "function"
+		},
+		{
+			"inputs": [
+				{
+					"internalType": "address",
+					"name": "owner",
+					"type": "address"
+				},
+				{
+					"internalType": "address",
+					"name": "operator",
+					"type": "address"
+				}
+			],
+			"name": "isApprovedForAll",
+			"outputs": [
+				{
+					"internalType": "bool",
+					"name": "",
+					"type": "bool"
+				}
+			],
+			"stateMutability": "view",
+			"type": "function"
+		},
+		{
+			"inputs": [],
+			"name": "MINTER_ROLE",
+			"outputs": [
+				{
+					"internalType": "bytes32",
+					"name": "",
+					"type": "bytes32"
+				}
+			],
+			"stateMutability": "view",
+			"type": "function"
+		},
+		{
+			"inputs": [],
+			"name": "name",
+			"outputs": [
+				{
+					"internalType": "string",
+					"name": "",
+					"type": "string"
+				}
+			],
+			"stateMutability": "view",
+			"type": "function"
+		},
+		{
+			"inputs": [],
+			"name": "nftCount",
+			"outputs": [
+				{
+					"internalType": "uint256",
+					"name": "",
+					"type": "uint256"
+				}
+			],
+			"stateMutability": "view",
+			"type": "function"
+		},
+		{
+			"inputs": [
+				{
+					"internalType": "uint256",
+					"name": "tokenId",
+					"type": "uint256"
+				}
+			],
+			"name": "ownerOf",
+			"outputs": [
+				{
+					"internalType": "address",
+					"name": "",
+					"type": "address"
+				}
+			],
+			"stateMutability": "view",
+			"type": "function"
+		},
+		{
+			"inputs": [
+				{
+					"internalType": "bytes4",
+					"name": "interfaceId",
+					"type": "bytes4"
+				}
+			],
+			"name": "supportsInterface",
+			"outputs": [
+				{
+					"internalType": "bool",
+					"name": "",
+					"type": "bool"
+				}
+			],
+			"stateMutability": "view",
+			"type": "function"
+		},
+		{
+			"inputs": [],
+			"name": "symbol",
+			"outputs": [
+				{
+					"internalType": "string",
+					"name": "",
+					"type": "string"
+				}
+			],
+			"stateMutability": "view",
+			"type": "function"
+		},
+		{
+			"inputs": [
+				{
+					"internalType": "uint256",
+					"name": "tokenId",
+					"type": "uint256"
+				}
+			],
+			"name": "tokenURI",
+			"outputs": [
+				{
+					"internalType": "string",
+					"name": "",
+					"type": "string"
+				}
+			],
+			"stateMutability": "view",
+			"type": "function"
+		}
+	]`
+	contractABI, err := abi.JSON(strings.NewReader(transferEventABI))
+	if err != nil {
+		return common.Address{}, nil, fmt.Errorf("failed to parse contract ABI: %v", err)
+	}
+
+	type LogTransfer struct {
+		From    common.Address
+		To      common.Address
+		TokenId *big.Int
+	}
+
+	var transferEvent LogTransfer
+
+	type TokenId struct {
+		TokenId *big.Int
+	}
+
+	var tokenId TokenId
+
+	log.Printf("transferEvent.From", delog)
+	err = contractABI.UnpackIntoInterface(&tokenId, "Transfer", delog.Data)
+	if err != nil {
+		return common.Address{}, nil, fmt.Errorf("failed to unpack Transfer event log: %v", err)
+	}
+
+	log.Printf("tokenId", tokenId.TokenId)
+	log.Printf("transferEvent.From", delog)
+
+	transferEvent.From = common.HexToAddress(delog.Topics[1].Hex())
+	transferEvent.To = common.HexToAddress(delog.Topics[2].Hex())
+	transferEvent.TokenId = delog.Topics[3].Big()
+
+	return transferEvent.To, transferEvent.TokenId, nil
+}
