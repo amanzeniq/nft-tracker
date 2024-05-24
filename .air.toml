@@ -8,9 +8,9 @@ watch = [
 ]
 include_ext = ["go"]
 exclude_dir = ["tmp", "vendor"]
-cmd = "go build -o ./tmp/main ./cmd/main/main.go"
+cmd = "go build -o ./tmp/main ./main.go"
 
 # Define the entry point of your application.
 [run]
 command = "go"
-args = ["run", "cmd/main/main.go"]
+args = ["run", "main.go"]
